@@ -136,7 +136,6 @@ void readWaterSensors (bool save) {
     k_cool_water = 0;
   }
   if (regchange && save) {
-    // Serial.printf("Hot water data: %.2f m^3\n", float(hot_water_occ + k_hot_water/20.0));
     f = SPIFFS.open("/conf.wtr", "w");
     f.printf("%d,%d,%d,%d\n", k_hot_water, k_cool_water, hot_water_occ, cool_water_occ);
     f.close();
@@ -356,7 +355,31 @@ void setup() {
   delay(5000);
   if (wifi_sta_connection) {
     Serial.println("\n\nBegin websocket client");
-    ws_client.onMessage(onEventMessage);
+    ws_client.onMessage([&](WebsocketsMessage message) {
+      Serial.println(message.data());
+      DeserializationError err = deserializeJson(doc, message.data());
+      if (err) {
+        return;
+      }
+      JsonObject obj = doc.as<JsonObject>();
+      String method = obj["data"]["method"];
+      JsonArray relays = obj["data"]["relays"].as<JsonArray>();
+      bool relay_status = false;
+      if (method == "OffAllDevice") {
+        relayWrite(0x00);
+      } else if (method == "OnAllDevice") {
+        relayWrite(0xFF);
+      } else if (method == "OnDevice") {
+        relay_status = 1;
+      } else if (method == "OffDevice") {
+        relay_status = 0;
+      }
+      for (JsonVariant var:relays) {
+        int relay_pin = var.as<String>().substring(var.as<String>().length()-1).toInt();
+        Serial.printf("Relay-%d\n", relay_pin);
+        relayWrite(relay_pin, relay_status);
+      }
+    });
     ws_client.onEvent(onEventsCallback);
     connect_socket:
     Serial.println("WebSocket connecting...");
@@ -369,6 +392,14 @@ void setup() {
     }
   }
   dht.begin();
+  f = SPIFFS.open("/conf.wtr", "r");
+  if (f.available()) {
+    String str = f.readString();
+    sscanf(str.c_str(), "%d,%d,%d,%d\n", &k_hot_water, &k_cool_water, &hot_water_occ, &cool_water_occ);
+  }
+  cold_water = float(cool_water_occ + k_cool_water/20.0);
+  hot_water = float(hot_water_occ + k_hot_water/20.0);
+  f.close();
   per_second = millis();
 }
 
@@ -377,24 +408,26 @@ void loop() {
   if (millis() - per_second >= 1000) {
     per_second = millis();
     per_request ++;
-    temperature = dht.readTemperature();
-    humidity = dht.readHumidity();
+    if (dht.readTemperature() > 0.0) temperature = dht.readTemperature();
+    if (dht.readHumidity() > 0.0) humidity = dht.readHumidity();
   }
   if (per_request >= 5) {
-    char tmp[200];
+    char tmp[400];
     per_request = 0;
-    http_client.addHeader("Content-Type", "Application/Json");
-    http_client.begin("http://85.209.88.209/api/v1/sensor-data/");
-    sprintf(tmp, "{\"device_token\":\"%s\",\"data\":{\"6\":%.2f,\"5\":%.2f,\"4\":%.2f,\"3\":%2.f}}", getConfigValue("device_token"), humidity, temperature, cold_water, hot_water);
-    Serial.println(tmp);
-    int res = http_client.POST(String(tmp));
-    Serial.printf("HTTP response code: %d\n", res);
+    if (wifi_sta_connection) {
+      http_client.begin("http://85.209.88.209/api/v1/sensor-data/");
+      http_client.addHeader("Content-Type", "application/json");
+      sprintf(tmp, "{\"device_token\":\"%s\",\"data\":{\"6\":%.2f,\"5\":%.2f,\"4\":%.2f,\"3\":%.2f}}", getConfigValue("device_token").c_str(), humidity, temperature, cold_water, hot_water);
+      Serial.println(tmp);
+      int res = http_client.POST(String(tmp));
+      http_client.end();
+      Serial.printf("HTTP response code: %d\n", res);
+    }
   }
   if (!digitalRead(0) && !btn_stat) {
     btn_time = millis();
     btn_stat = 1;
   }
-  if(per_request >= )
   if (digitalRead(0)) btn_stat = 0;
   if (btn_stat) {
     if (millis() - btn_time >= 5000) {
