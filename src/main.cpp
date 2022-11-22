@@ -7,6 +7,7 @@
 #include <HTTPClient.h>
 #include <WebServer.h>
 #include <ArduinoWebSockets.h>
+#include <DHT.h>
 
 using namespace websockets;
 
@@ -15,12 +16,15 @@ using namespace websockets;
 #define SDATA_PIN   25
 #define STORE_PIN   17
 #define CLOCK_PIN   16
+#define DHT_PIN     32
+#define DHT_TYPE    DHT11
 
+DHT dht(DHT_PIN, DHT_TYPE);
 uint8_t SHIFTREG = 0x00;
 HTTPClient http_client;
 WebServer http_server;
 WebsocketsClient ws_client;
-StaticJsonDocument <200>doc;
+StaticJsonDocument <400>doc;
 static File f;
 
 const char* wpa_conf_path = "/wpa_supplicants.conf";
@@ -30,7 +34,10 @@ bool hot_water_signal = 0, cool_water_signal = 0;
 uint32_t hot_water_occ = 0, cool_water_occ = 0;
 uint8_t k_hot_water = 0, k_cool_water = 0;
 uint32_t btn_time = 0;
+float hot_water = 0.0, cold_water = 0.0, temperature = 0.0, humidity = 0.0;
 bool btn_stat = 0, relay_status[8], configuration_succes = 0;
+uint8_t per_request = 0;
+uint32_t per_second = 0;
 
 String configNames[] = {
   "ssid_sta",
@@ -51,7 +58,7 @@ String configValues[] = {
   "",
   "Admin",
   "12345",
-  "9B5QAr3JTtEr2eJbATs7f15zYpbOllz8",
+  "9B5QAR3JTTER2EJBATS7F15ZYPBOLLZ8",
   "ScrollHouse",
   "ws://85.209.88.209/ws/device/"
 };
@@ -112,6 +119,7 @@ void readWaterSensors (bool save) {
     hot_water_signal = digitalRead(HWATER_PIN);
     k_hot_water++;
     regchange = 1;
+    hot_water = float(hot_water_occ + k_hot_water/20.0);
   }
   if (k_hot_water >= 20) {
     hot_water_occ ++;
@@ -121,6 +129,7 @@ void readWaterSensors (bool save) {
     cool_water_signal = digitalRead(CWATER_PIN);
     k_cool_water++;
     regchange = 1;
+    cold_water = float(cool_water_occ + k_cool_water/20.0);
   }
   if (k_cool_water >= 20) {
     cool_water_occ ++;
@@ -158,10 +167,39 @@ void relayWrite(uint8_t reg) {
 void handleRelay () {
   if (http_server.authenticate(getConfigValue("login_ap").c_str(), getConfigValue("parol_ap").c_str())) {
     if (http_server.args() > 0) {
-      uint8_t relayPin = uint8_t(http_server.arg("relay_pin").toInt());
-      relay_status[relayPin-1] = bool(http_server.arg("relay_stat").toInt());
-      Serial.printf("relayWrite(%d, %d)\n", relayPin, relay_status[relayPin-1]);
-      relayWrite(relayPin, relay_status[relayPin-1]);
+      if (http_server.args() == 1) {
+        DeserializationError err = deserializeJson(doc, http_server.arg(0));
+        if (err) {
+          http_server.send(200, "application/json", "{\"message\":\"Error on Json Format\"}");
+          return;
+        }
+        JsonObject obj = doc.as<JsonObject>();
+        String method = obj["data"]["method"];
+        JsonArray relays = obj["data"]["relays"].as<JsonArray>();
+        bool relay_status = false;
+        if (method == "OffAllDevice") {
+          relayWrite(0x00);
+          goto end_handle;
+        } else if (method == "OnAllDevice") {
+          relayWrite(0xFF);
+          goto end_handle;
+        } else if (method == "OnRelay") {
+          relay_status = 1;
+        } else if (method == "OffRelay") {
+          relay_status = 0;
+        }
+        for (JsonVariant var:relays) {
+          int relay_pin = var.as<String>().substring(var.as<String>().length()-1).toInt();
+          Serial.printf("Relay-%d\n", relay_pin);
+          relayWrite(relay_pin, relay_status);
+        }
+      } else {
+        uint8_t relayPin = uint8_t(http_server.arg("relay_pin").toInt());
+        relay_status[relayPin-1] = bool(http_server.arg("relay_stat").toInt());
+        Serial.printf("relayWrite(%d, %d)\n", relayPin, relay_status[relayPin-1]);
+        relayWrite(relayPin, relay_status[relayPin-1]);
+      }
+      end_handle:
       http_server.send(200, "application/json", "{\"message\":\"OK\"}");
     } else {
       http_server.send(400, "application/json", "{\"message\":\"Bad Request\"}");
@@ -172,18 +210,22 @@ void handleRelay () {
 void handleSetWiFi () {
   if (http_server.authenticate(getConfigValue("login_ap").c_str(), getConfigValue("parol_ap").c_str())) {
     if (http_server.args() > 0) {
-      for (int i = 0; i < http_server.args(); i++) {
-        if (http_server.hasArg(configNames[i])) {
+      if (http_server.args() == 1) {
+        Serial.println(http_server.arg(0));
+        DeserializationError err = deserializeJson(doc, http_server.arg(0));
+        if (err) {
+          http_server.send(200, "application/json", "{\"message\":\"Error on Json Format\"}");
+          return;
+        }
+        JsonObject obj = doc.as<JsonObject>();
+        for (JsonPair pair:obj) {
+          configValues[getConfigIndex(pair.key().c_str())] = pair.value().as<char*>();
+        }
+      } else {
+        for (int i = 0; i < http_server.args(); i++) {
           configValues[i] = http_server.arg(configNames[i]);
-        } else {
-          deserializeJson(doc, http_server.arg(i));
-          break;
         }
       }
-      const char* ssid = doc["ssid_sta"];
-      const char* key = doc["pwd_sta"];
-      configValues[getConfigIndex("ssid_sta")] = String(ssid);
-      configValues[getConfigIndex("pwd_sta")] = String(key);
       configuration_succes = 1;
       http_server.send(200, "application/json", "{\"message\":\"OK\"}");
     } else {
@@ -222,14 +264,29 @@ void onEventsCallback(WebsocketsEvent event, String data) {
 
 void onEventMessage (WebsocketsMessage message) {
   Serial.println(message.data());
-  if (!deserializeJson(doc, message.data())) {
-    Serial.println((const char*) doc[0]);
-    // JsonObject obj = doc.as<JsonObject>();
-    // if (obj[String("enabled")] == false) {
-    // } else if (obj[String("enabled")] == true) {
-    // }
+  DeserializationError err = deserializeJson(doc, message.data());
+  if (err) {
+    return;
   }
-};
+  JsonObject obj = doc.as<JsonObject>();
+  String method = obj["data"]["method"];
+  JsonArray relays = obj["data"]["relays"].as<JsonArray>();
+  bool relay_status = false;
+  if (method == "OffAllDevice") {
+    relayWrite(0x00);
+  } else if (method == "OnAllDevice") {
+    relayWrite(0xFF);
+  } else if (method == "OnDevice") {
+    relay_status = 1;
+  } else if (method == "OffDevice") {
+    relay_status = 0;
+  }
+  for (JsonVariant var:relays) {
+    int relay_pin = var.as<String>().substring(var.as<String>().length()-1).toInt();
+    Serial.printf("Relay-%d\n", relay_pin);
+    relayWrite(relay_pin, relay_status);
+  }
+}
 
 void setup() {
   pinMode(HWATER_PIN, INPUT_PULLUP);
@@ -238,7 +295,7 @@ void setup() {
   pinMode(STORE_PIN, OUTPUT);
   pinMode(CLOCK_PIN, OUTPUT);
   Serial.begin(115200);
-  if(!SPIFFS.begin(true)){
+  if(!SPIFFS.begin()){
       Serial.println("SPIFFS Mount Failed");
       return;
   }
@@ -285,7 +342,8 @@ void setup() {
       break;
     }
   }
-  if (WiFi.status() != WL_CONNECTED) {
+  if (WiFi.status() == WL_CONNECTED) Serial.println(" success");
+  else {
     WiFi.mode(WIFI_AP);
     WiFi.softAP(getConfigValue("ssid_ap").c_str(), getConfigValue("pwd_ap").length() >= 8 ? getConfigValue("pwd_ap").c_str() : NULL);
     Serial.printf("\n\nWiFi hotspot started name: %s , pwd: %s\n\n", getConfigValue("ssid_ap").c_str(), getConfigValue("pwd_ap").c_str());
@@ -300,22 +358,43 @@ void setup() {
     Serial.println("\n\nBegin websocket client");
     ws_client.onMessage(onEventMessage);
     ws_client.onEvent(onEventsCallback);
+    connect_socket:
     Serial.println("WebSocket connecting...");
     if (ws_client.connect(getConfigValue("ws_url") + getConfigValue("device_token"))) {
       Serial.println("WebSocket is connected...");
     } else {
       Serial.println("WebSocket connection is failed!!!");
-      delay(10000);
-      esp_restart();
+      delay(5000);
+      goto connect_socket;
     }
   }
+  dht.begin();
+  per_second = millis();
 }
 
 void loop() {
+  readWaterSensors (true);
+  if (millis() - per_second >= 1000) {
+    per_second = millis();
+    per_request ++;
+    temperature = dht.readTemperature();
+    humidity = dht.readHumidity();
+  }
+  if (per_request >= 5) {
+    char tmp[200];
+    per_request = 0;
+    http_client.addHeader("Content-Type", "Application/Json");
+    http_client.begin("http://85.209.88.209/api/v1/sensor-data/");
+    sprintf(tmp, "{\"device_token\":\"%s\",\"data\":{\"6\":%.2f,\"5\":%.2f,\"4\":%.2f,\"3\":%2.f}}", getConfigValue("device_token"), humidity, temperature, cold_water, hot_water);
+    Serial.println(tmp);
+    int res = http_client.POST(String(tmp));
+    Serial.printf("HTTP response code: %d\n", res);
+  }
   if (!digitalRead(0) && !btn_stat) {
     btn_time = millis();
     btn_stat = 1;
   }
+  if(per_request >= )
   if (digitalRead(0)) btn_stat = 0;
   if (btn_stat) {
     if (millis() - btn_time >= 5000) {
@@ -331,15 +410,15 @@ void loop() {
   }
   if (configuration_succes) {
     http_server.close();
-      WiFi.disconnect();
-      delay(1000);
-      f = SPIFFS.open(wpa_conf_path, "w");
-      for (int i = 0; i < 9; i++) {
-        f.printf("%s=%s\n", configNames[i].c_str(), configValues[i].c_str());
-      }
-      f.close();
-      delay(2000);
-      esp_restart();
+    WiFi.disconnect();
+    delay(1000);
+    f = SPIFFS.open(wpa_conf_path, "w");
+    for (int i = 0; i < 9; i++) {
+      f.printf("%s=%s\n", configNames[i].c_str(), configValues[i].c_str());
+    }
+    f.close();
+    delay(2000);
+    esp_restart();
   }
   delay(50);
 }
